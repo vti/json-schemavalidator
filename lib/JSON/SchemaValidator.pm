@@ -3,15 +3,42 @@ package JSON::SchemaValidator;
 use strict;
 use warnings;
 
-our $VERSION = '1.00';
+our $VERSION = '1.01';
 
 use B        ();
 use Storable ();
 require Carp;
-use URI;
+use Time::Piece;
 
 use JSON::SchemaValidator::Result;
 use JSON::SchemaValidator::Pointer qw(pointer);
+
+my $DATETIME_RE = qr/
+    ^
+        [0-9]{4}\-[0-9]{2}\-[0-9]{2}T[0-9]{2}
+        :
+        [0-9]{2}:[0-9]{2}
+        (?:\.[0-9]{1,6})?
+        (?:
+            Z
+            |
+            [-+][0-9]{2}:[0-9]{2}
+        )
+    $
+/ix;
+
+my $HOSTNAME_RE = qr/
+    (?:
+        (?:[a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.
+    )*
+    (?:[a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])
+/ix;
+
+my $EMAIL_RE = qr/
+    [a-z0-9\._\%\+!\$\&\*=\^\|\~#%\{\}\/\-]+
+    \@
+    $HOSTNAME_RE
+/ix;
 
 sub new {
     my $class = shift;
@@ -21,10 +48,31 @@ sub new {
     bless $self, $class;
 
     $self->{formats} = {
+        hostname => sub {
+            my ($hostname) = @_;
+
+            return 0 if length $hostname > 255;
+
+            return 0 unless $hostname =~ qr/^$HOSTNAME_RE$/;
+
+            return 0 if grep { length > 63 } split /\./, $hostname;
+
+            return 1;
+        },
+        email => sub {
+            my ($email) = @_;
+
+            return 0 unless $email =~ m/^$EMAIL_RE$/;
+
+            my ($username, $hostname) = split /@/, $email;
+
+            return 0 if length $hostname > 255;
+            return 0 if grep { length > 63 } split /\./, $hostname;
+
+            return 1;
+        },
         ipv4 => sub {
             my ($ipv4) = @_;
-
-            return 1 unless _is_string($ipv4);
 
             my @parts = split m/\./, $ipv4;
 
@@ -41,8 +89,6 @@ sub new {
         ipv6 => sub {
             my ($ipv6) = @_;
 
-            return 1 unless _is_string($ipv6);
-
             my @parts = split m/\:/, $ipv6;
 
             return unless @parts > 0 && @parts < 9;
@@ -55,13 +101,16 @@ sub new {
 
             return 1;
         },
-        uri => sub {
-            my ($uri) =@_;
+        'date-time' => sub {
+            my ($date_time) = @_;
 
-            return 1 unless _is_string($uri);
+            return unless $date_time =~ $DATETIME_RE;
 
-            my $url = eval { URI->new($uri) };
-            return unless $url && $url->scheme;
+            $date_time =~ s{\.[0-9]*}{};
+            $date_time =~ s{Z$}{+00:00}i;
+            $date_time =~ s{:([0-9]+)$}{$1}i;
+
+            return unless eval { Time::Piece->strptime(uc($date_time), '%Y-%m-%dT%T%z') };
 
             return 1;
         }
@@ -70,6 +119,8 @@ sub new {
 
     return $self;
 }
+
+sub formats { shift->{formats} }
 
 sub validate {
     my $self = shift;
@@ -247,14 +298,21 @@ sub _validate {
 
     $self->_resolve_refs($context, $schema);
 
-    if (my $types = $schema->{type}) {
-        my $subresult = $self->_validate_type($context, $json, $types);
-        $result->merge($subresult);
-    }
+    if (_is_object($schema)) {
+        if (my $types = $schema->{type}) {
+            my $subresult = $self->_validate_type($context, $json, $types);
+            $result->merge($subresult);
+        }
 
-    if (my $enum = $schema->{enum}) {
-        my $subresult = $self->_validate_enum($context, $json, $enum);
-        $result->merge($subresult);
+        if (my $enum = $schema->{enum}) {
+            my $subresult = $self->_validate_enum($context, $json, $enum);
+            $result->merge($subresult);
+        }
+
+        if (exists $schema->{const}) {
+            my $subresult = $self->_validate_const($context, $json, $schema->{const});
+            $result->merge($subresult);
+        }
     }
 
     if (_is_object($json)) {
@@ -281,15 +339,17 @@ sub _validate {
         $result->merge($subresult);
     }
 
-    if (my $format = $schema->{format}) {
-        if (my $cb = $self->{formats}->{$format}) {
-            if (!$cb->($json)) {
-                $result->add_error(
-                    uri       => $pointer,
-                    message   => 'Must be of format ' . $format,
-                    attribute => 'format',
-                    details   => [$format]
-                );
+    if (_is_string($json)) {
+        if (my $format = $schema->{format}) {
+            if (my $cb = $self->{formats}->{$format}) {
+                if (!$cb->($json)) {
+                    $result->add_error(
+                        uri       => $pointer,
+                        message   => 'Must be of format ' . $format,
+                        attribute => 'format',
+                        details   => [$format]
+                    );
+                }
             }
         }
     }
@@ -307,7 +367,7 @@ sub _validate_type {
 
     my @results;
     foreach my $type (@$types) {
-        if (ref $type eq 'HASH') {
+        if (_is_object($type)) {
             my $subresult = $self->_validate($context, $json, $type);
             push @results, $subresult;
         }
@@ -474,7 +534,7 @@ sub _validate_object {
     my @additional_properties = grep { !exists $schema->{properties}->{$_} } keys %$json;
 
     if (exists $schema->{additionalProperties}) {
-        if (_is_bool($schema->{additionalProperties}) && !$schema->{additionalProperties}) {
+        if (_is_boolean($schema->{additionalProperties}) && !$schema->{additionalProperties}) {
           PROPERTY: foreach my $additional_property (@additional_properties) {
                 if (my $pattern_properties = $schema->{patternProperties}) {
                     foreach my $pattern_property (keys %$pattern_properties) {
@@ -574,7 +634,7 @@ sub _validate_array {
         }
 
         if ($got_length > $exp_length) {
-            if (_is_bool($schema->{additionalItems})) {
+            if (_is_boolean($schema->{additionalItems})) {
                 if (!$schema->{additionalItems}) {
                     $result->add_error(
                         uri       => $context->{pointer},
@@ -606,7 +666,7 @@ sub _validate_array {
     if ($schema->{uniqueItems}) {
         my $seen = {};
         foreach my $el (@$json) {
-            my $hash = JSON::encode_json($el);
+            my $hash = ref $el ? JSON::encode_json($el) : defined $el ? $el : 'null';
 
             if (exists $seen->{$hash}) {
                 $result->add_error(
@@ -618,6 +678,16 @@ sub _validate_array {
                 last;
             }
             $seen->{$hash}++;
+        }
+    }
+
+    if ($schema->{contains}) {
+        if (!@$json) {
+            $result->add_error(
+                uri       => $context->{pointer},
+                message   => "Must not be empty",
+                attribute => 'contains'
+            );
         }
     }
 
@@ -695,6 +765,19 @@ sub _validate_number {
         }
     }
 
+    if (_is_number($schema->{exclusiveMaximum})) {
+        my $maximum = $schema->{exclusiveMaximum};
+
+        if ($json >= $maximum) {
+            $result->add_error(
+                uri       => $context->{pointer},
+                message   => "Must be less than or equals to $maximum",
+                attribute => 'maximum',
+                details   => [$maximum]
+            );
+        }
+    }
+
     if (defined(my $maximum = $schema->{maximum})) {
         if ($schema->{exclusiveMaximum}) {
             if ($json >= $maximum) {
@@ -719,8 +802,7 @@ sub _validate_number {
     }
 
     if (defined(my $divisibleBy = $schema->{divisibleBy})) {
-        my $div = $json / $divisibleBy;
-        if ($json - int($div) * $divisibleBy != 0) {
+        if (sprintf('%0.6f', $json) ne sprintf('%0.6f', int($json / $divisibleBy) * $divisibleBy)) {
             $result->add_error(
                 uri       => $context->{pointer},
                 message   => "Must be divisible by $divisibleBy",
@@ -731,8 +813,7 @@ sub _validate_number {
     }
 
     if (defined(my $multipleOf = $schema->{multipleOf})) {
-        my $div = $json / $multipleOf;
-        if ($json - int($div) * $multipleOf != 0) {
+        if (sprintf('%0.6f', $json) ne sprintf('%0.6f', int($json / $multipleOf) * $multipleOf)) {
             $result->add_error(
                 uri       => $context->{pointer},
                 message   => "Must be multiple of by $multipleOf",
@@ -753,11 +834,11 @@ sub _validate_enum {
 
     my $set = {};
     foreach my $el (@$enum) {
-        my $hash = JSON::encode_json($el);
+        my $hash = ref $el ? JSON::encode_json($el) : $el;
         $set->{$hash} = 1;
     }
 
-    my $hash = JSON::encode_json($json);
+    my $hash = ref $json ? JSON::encode_json($json) : defined $json ? $json : 'null';
 
     if (!exists $set->{$hash}) {
         $result->add_error(
@@ -765,6 +846,67 @@ sub _validate_enum {
             message   => "Must be one of",
             attribute => 'enum',
             details   => [@$enum]
+        );
+    }
+
+    return $result;
+}
+
+sub _validate_const {
+    my $self = shift;
+    my ($context, $json, $const) = @_;
+
+    my $result = $self->_build_result();
+
+    my $exp_type = _type($const);
+
+    if (_is_type($json, $exp_type) || ($exp_type eq 'integer' && _type($json) eq 'number')) {
+        if (_is_object($json) || _is_array($json)) {
+            if (JSON->new->utf8->canonical->encode($json) ne JSON->new->utf8->canonical->encode($const)) {
+                $result->add_error(
+                    uri       => $context->{pointer},
+                    message   => "Must be equal to const",
+                    attribute => 'const',
+                );
+            }
+        }
+        elsif (_is_number($json)) {
+            if (sprintf('%0.6f', $const) ne sprintf('%0.6f', $json)) {
+                $result->add_error(
+                    uri       => $context->{pointer},
+                    message   => "Must be of equal to $const",
+                    attribute => 'const',
+                    details   => [$const]
+                );
+            }
+        }
+        elsif (_is_string($json)) {
+            if ($json ne $const) {
+                $result->add_error(
+                    uri       => $context->{pointer},
+                    message   => "Must be of equal to $const",
+                    attribute => 'const',
+                    details   => [$const]
+                );
+            }
+        }
+        elsif (_is_boolean($json)) {
+            if ($const != $json) {
+                $result->add_error(
+                    uri       => $context->{pointer},
+                    message   => "Must be of equal to $const",
+                    attribute => 'const',
+                    details   => [$const]
+                );
+            }
+        }
+    }
+    else {
+        $result->add_error(
+            uri       => $context->{pointer},
+            message   => "Must be of type $exp_type",
+            attribute => 'const',
+            details   => [$exp_type]
         );
     }
 
@@ -783,7 +925,7 @@ sub _is_array {
     return defined $value && ref $value eq 'ARRAY';
 }
 
-sub _is_bool {
+sub _is_boolean {
     my ($value) = @_;
 
     return defined $value && JSON::is_bool($value);
@@ -800,7 +942,7 @@ sub _is_number {
     my $flags = $b_obj->FLAGS;
     return 1
       if $flags & (B::SVp_IOK() | B::SVp_NOK())
-      and !($flags & B::SVp_POK());
+      && !($flags & B::SVp_POK());
 
     return 0;
 }
@@ -808,7 +950,15 @@ sub _is_number {
 sub _is_integer {
     my ($value) = @_;
 
-    return _is_number($value) && $value !~ m/[\.e]/;
+    return 0 unless defined $value;
+    return 0 if ref $value;
+    return 0 if JSON::is_bool($value);
+
+    my $b_obj = B::svref_2object(\$value);
+    my $flags = $b_obj->FLAGS;
+    return 1 if ($flags & B::SVp_IOK()) && !($flags & B::SVp_POK());
+
+    return 0;
 }
 
 sub _is_string {
@@ -816,7 +966,7 @@ sub _is_string {
 
     return 0 unless defined $value;
     return 0 if ref $value;
-    return 0 if _is_bool($value);
+    return 0 if _is_boolean($value);
     return 0 if _is_number($value);
 
     return 1;
@@ -825,39 +975,35 @@ sub _is_string {
 sub _is_null {
     my ($value) = @_;
 
-    return !defined $value;
+    return defined $value ? 0 : 1;
 }
 
 sub _is_type {
     my ($value, $type) = @_;
 
-    if ($type eq 'object') {
-        return _is_object($value);
+    my $real_type = _type($value);
+
+    if ($type eq 'number') {
+        return 1 if $real_type eq 'integer';
     }
-    elsif ($type eq 'array') {
-        return _is_array($value);
-    }
-    elsif ($type eq 'string') {
-        return _is_string($value);
-    }
-    elsif ($type eq 'number') {
-        return _is_number($value);
-    }
-    elsif ($type eq 'integer') {
-        return _is_integer($value);
-    }
-    elsif ($type eq 'boolean') {
-        return _is_bool($value);
-    }
-    elsif ($type eq 'null') {
-        return _is_null($value);
-    }
-    elsif ($type eq 'any') {
-        return 1;
-    }
-    else {
-        Carp::croak("Unknown type: '$type'");
-    }
+
+    return $real_type eq $type;
+
+    return _type($value) eq $type ? 1 : 0;
+}
+
+sub _type {
+    my ($value) = @_;
+
+    return 'null'    if _is_null($value);
+    return 'object'  if _is_object($value);
+    return 'array'   if _is_array($value);
+    return 'boolean' if _is_boolean($value);
+    return 'integer' if _is_integer($value);
+    return 'number'  if _is_number($value);
+    return 'string'  if _is_string($value);
+
+    Carp::croak("Unknown type");
 }
 
 sub _subschema {
@@ -916,6 +1062,23 @@ __END__
 JSON::SchemaValidator - JSON Schema Validator
 
 =head1 SYNOPSIS
+
+    my $validator = JSON::SchemaValidator->new;
+
+    my $result = $validator->validate([1], {type => 'object'});
+
+    if (!$result->is_success) {
+        #  [
+        #    {
+        #        uri       => '#',
+        #        message   => "Must be of type object",
+        #        attribute => 'type',
+        #        details   => ['object']
+        #    }
+        #  ]
+
+        return $result->errors;
+    }
 
 =head1 DESCRIPTION
 

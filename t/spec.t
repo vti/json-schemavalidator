@@ -63,7 +63,6 @@ my $validator = JSON::SchemaValidator->new(
 
 foreach my $file (@files) {
     next if $file =~ m/ecmascript-regex/;
-    next if $file =~ m/zeroTerminatedFloats/;
     next if $file =~ m/bignum/;
     next if $file =~ m/format/;
 
@@ -90,7 +89,7 @@ foreach my $file (@files) {
 
                     if ($result) {
                         my $diag = sprintf '%s <=> %s %s (%s)', JSON::encode_json($schema),
-                          JSON::encode_json($test->{data}), $result->errors_json, $file;
+                          JSON->new->utf8->allow_nonref(1)->encode($test->{data}), $result->errors_json, $file;
 
                         if ($test->{valid}) {
                             ok $result->is_success, "must be valid: $diag";

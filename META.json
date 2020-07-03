@@ -43,7 +43,6 @@
       "runtime" : {
          "requires" : {
             "JSON" : "0",
-            "URI" : "0",
             "URI::Escape" : "0"
          }
       }
@@ -60,10 +59,10 @@
          "web" : "https://github.com/vti/json-schemavalidator"
       }
    },
-   "version" : "1.00",
+   "version" : "1.01",
    "x_contributors" : [
       "vti <viacheslav.t@gmail.com>"
    ],
-   "x_serialization_backend" : "JSON::PP version 4.04",
+   "x_serialization_backend" : "JSON::PP version 4.02",
    "x_static_install" : 1
 }
